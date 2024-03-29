@@ -120,7 +120,7 @@ public class App extends AbstractVerticle implements Handler<HttpServerRequest> 
   }
 
   @Override
-  public void start(Promise<Void> startPromise) throws Exception {
+  public void start() throws Exception {
     int port = 8080;
     server = vertx.createHttpServer(new HttpServerOptions())
         .requestHandler(App.this);
@@ -141,37 +141,24 @@ public class App extends AbstractVerticle implements Handler<HttpServerRequest> 
     System.out.println(options.getDatabase() + options.getHost() + options.getUser() + options.getPassword());
     options.setCachePreparedStatements(true);
     options.setPipeliningLimit(100_000); // Large pipelining means less flushing and we use a single connection anyway
-    PgConnection.connect(vertx, options)
-        .flatMap(conn -> {
-          System.out.println(
-              "Got Conn " + options.getDatabase() + options.getHost() + options.getUser() + options.getPassword());
-          client = (SqlClientInternal) conn;
-          System.out.println(
-              "Connected  " + options.getDatabase() + options.getHost() + options.getUser() + options.getPassword());
-          Future<PreparedStatement> f1 = conn.prepare(SELECT_WORLD)
-              .andThen(onSuccess(ps -> SELECT_WORLD_QUERY = ps.query()));
-          Future<PreparedStatement> f2 = conn.prepare(SELECT_FORTUNE)
-              .andThen(onSuccess(ps -> SELECT_FORTUNE_QUERY = ps.query()));
-          Future<PreparedStatement> f3 = conn.prepare(UPDATE_WORLD)
-              .andThen(onSuccess(ps -> UPDATE_WORLD_QUERY = ps.query()));
-          Future<WorldCache> f4 = conn.preparedQuery(SELECT_WORLDS)
-              .collecting(
-                  Collectors.mapping(row -> new CachedWorld(row.getInteger(0), row.getInteger(1)), Collectors.toList()))
-              .execute()
-              .map(worlds -> new WorldCache(worlds.value()))
-              .andThen(onSuccess(wc -> WORLD_CACHE = wc));
-          return CompositeFuture.join(f1, f2, f3, f4);
-        })
-        .transform(ar -> {
-          databaseErr = ar.cause();
-          if (databaseErr != null) {
-            databaseErr.printStackTrace();
-          }
-          return server.listen(port);
-        })
-        .<Void>mapEmpty()
-        .onComplete(startPromise)
-        .onFailure(e -> System.out.println(e.toString()));
+
+    var conn = Future.await(PgConnection.connect(vertx, options));
+    client = (SqlClientInternal) conn;
+
+    System.out.println(
+        "Connected  " + options.getDatabase() + options.getHost() + options.getUser() + options.getPassword());
+    var f1 = Future.await(conn.prepare(SELECT_WORLD)
+        .andThen(onSuccess(ps -> SELECT_WORLD_QUERY = ps.query())));
+    var f2 = Future.await(conn.prepare(SELECT_FORTUNE)
+        .andThen(onSuccess(ps -> SELECT_FORTUNE_QUERY = ps.query())));
+    var f3 = Future.await(conn.prepare(UPDATE_WORLD)
+        .andThen(onSuccess(ps -> UPDATE_WORLD_QUERY = ps.query())));
+    WORLD_CACHE = Future.await(conn.preparedQuery(SELECT_WORLDS)
+        .collecting(
+            Collectors.mapping(row -> new CachedWorld(row.getInteger(0), row.getInteger(1)), Collectors.toList()))
+        .execute()
+        .map(worlds -> new WorldCache(worlds.value())));
+    server.listen(port);
   }
 
   private static <T> Handler<AsyncResult<T>> onSuccess(Handler<T> handler) {
@@ -278,7 +265,7 @@ public class App extends AbstractVerticle implements Handler<HttpServerRequest> 
     });
   }
 
-  class Queries implements Handler<AsyncResult<RowSet<Row>>> {
+  class Queries {
 
     boolean failed;
     JsonArray worlds = new JsonArray();
@@ -293,35 +280,15 @@ public class App extends AbstractVerticle implements Handler<HttpServerRequest> 
     }
 
     private void handle() {
-      client.group(c -> {
-        for (int i = 0; i < queries; i++) {
-          c.preparedQuery(SELECT_WORLD).execute(Tuple.of(randomWorld()), this);
-        }
-      });
-    }
+      var rs = Future.await(client.preparedQuery(SELECT_WORLD).execute(Tuple.of(randomWorld())));
+      final Tuple row = rs.iterator().next();
+      worlds.add(new JsonObject().put("id", "" + row.getInteger(0)).put("randomNumber", "" + row.getInteger(1)));
+      resp
+          .putHeader(HttpHeaders.SERVER, SERVER)
+          .putHeader(HttpHeaders.DATE, dateString)
+          .putHeader(HttpHeaders.CONTENT_TYPE, RESPONSE_TYPE_JSON)
+          .end(worlds.encode(), NULL_HANDLER);
 
-    @Override
-    public void handle(AsyncResult<RowSet<Row>> ar) {
-      if (!failed) {
-        if (ar.failed()) {
-          failed = true;
-          sendError(req, ar.cause());
-          return;
-        }
-
-        // we need a final reference
-        final Tuple row = ar.result().iterator().next();
-        worlds.add(new JsonObject().put("id", "" + row.getInteger(0)).put("randomNumber", "" + row.getInteger(1)));
-
-        // stop condition
-        if (worlds.size() == queries) {
-          resp
-              .putHeader(HttpHeaders.SERVER, SERVER)
-              .putHeader(HttpHeaders.DATE, dateString)
-              .putHeader(HttpHeaders.CONTENT_TYPE, RESPONSE_TYPE_JSON)
-              .end(worlds.encode(), NULL_HANDLER);
-        }
-      }
     }
   }
 
@@ -459,6 +426,7 @@ public class App extends AbstractVerticle implements Handler<HttpServerRequest> 
     printConfig(vertx);
     vertx.deployVerticle(App.class.getName(),
         new DeploymentOptions().setInstances(eventLoopPoolSize)
+            .setThreadingModel(ThreadingModel.VIRTUAL_THREAD)
             .setConfig(config),
         event -> {
           if (event.succeeded()) {
